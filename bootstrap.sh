@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Portable bootstrap for Qwen3.8-Flash-Next UD-Q3_K_XL on 12/16/32 GB NVIDIA GPUs.
+# Portable bootstrap for Qwen3.8-Flash-Next UD-Q3_K_XL on 12/16/24/32/48 GB NVIDIA GPUs.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -41,6 +41,7 @@ readonly MIN_RAM_KIB=$((64000000000 / 1024))
 readonly RECOMMENDED_RAM_KIB=$((96000000000 / 1024))
 readonly MIN_CAPACITY_KIB=$((130 * 1024 * 1024))
 readonly HEALTH_TIMEOUT_SECONDS=1800
+readonly BOOTSTRAP_LOCK_DIR="/var/lock/qwen38-bootstrap.lock.d"
 
 STAGE="initialization"
 TEMP_FILES=()
@@ -50,20 +51,26 @@ DEPLOYMENT_COMPLETE=false
 REQUESTED_PROFILE=""
 RETUNE=false
 FORCE_PROFILE=false
+DRY_RUN=false
+BOOTSTRAP_LOCK_HELD=false
+FLOCK_HELD=false
 
 usage() {
     cat <<'USAGE'
-Usage: sudo ./bootstrap.sh {12|16|32|auto} [--retune] [--force-profile]
+Usage: sudo ./bootstrap.sh {12|16|24|32|48|auto} [--retune] [--force-profile] [--dry-run]
 
 VRAM profiles:
   12       Experimental low-VRAM adaptive profile
   16       Balanced adaptive profile
+  24       Q8-first adaptive performance profile
   32       Locked, validated RTX 5090-class production profile
-  auto     Select from physical GPU VRAM (10.5-14.9, 15-23.9, or >=30 GiB)
+  48       Q8 adaptive high-VRAM profile
+  auto     Select from tolerant physical-VRAM bands (10.5 through 56 GiB)
 
 Options:
-  --retune        Refit a 12/16 GB profile; model, build, and API key are reused
+  --retune        Refit an adaptive profile; model, build, and API key are reused
   --force-profile Override the manual profile VRAM safety check (expert use only)
+  --dry-run        Inspect hardware and print strategy without making changes
   -h, --help      Show this help
 USAGE
 }
@@ -80,6 +87,10 @@ cleanup() {
     if [[ "${PRODUCTION_STARTED}" == true && "${DEPLOYMENT_COMPLETE}" != true && -x "${CONTROL_SCRIPT}" ]]; then
         PRODUCTION_STARTED=false
         "${CONTROL_SCRIPT}" stop >/dev/null 2>&1 || true
+    fi
+    if [[ "${BOOTSTRAP_LOCK_HELD}" == true ]]; then
+        rm -f -- "${BOOTSTRAP_LOCK_DIR}/pid"
+        rmdir -- "${BOOTSTRAP_LOCK_DIR}" 2>/dev/null || true
     fi
     for path in "${TEMP_FILES[@]:-}"; do
         if [[ -n "${path}" && "${path}" == /tmp/qwen38.* ]]; then
@@ -111,22 +122,79 @@ atomic_write() {
     install -o root -g root -m "${mode}" "${temporary}" "${destination}"
 }
 
+acquire_bootstrap_lock() {
+    local owner="unknown"
+    if ! mkdir -- "${BOOTSTRAP_LOCK_DIR}" 2>/dev/null; then
+        [[ -r "${BOOTSTRAP_LOCK_DIR}/pid" ]] && owner="$(<"${BOOTSTRAP_LOCK_DIR}/pid")"
+        die "Another qwen38 bootstrap may be running (bootstrap lock owner: ${owner}). If that process no longer exists, remove ${BOOTSTRAP_LOCK_DIR} and rerun."
+    fi
+    BOOTSTRAP_LOCK_HELD=true
+    printf '%s\n' "$$" >"${BOOTSTRAP_LOCK_DIR}/pid"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>/var/lock/qwen38-bootstrap.lock
+        flock -n 9 || die "Another qwen38 bootstrap holds the flock lock."
+        FLOCK_HELD=true
+    fi
+}
+
+acquire_flock_after_dependencies() {
+    [[ "${FLOCK_HELD}" == false ]] || return 0
+    command -v flock >/dev/null 2>&1 || die "util-linux installation completed without flock."
+    exec 9>/var/lock/qwen38-bootstrap.lock
+    flock -n 9 || die "Another qwen38 bootstrap holds the flock lock."
+    FLOCK_HELD=true
+}
+
+print_array_values() {
+    local value first=true
+    for value in "$@"; do
+        [[ "${first}" == true ]] || printf ' '
+        printf '%s' "${value}"
+        first=false
+    done
+    printf '\n'
+}
+
+print_dry_run_strategy() {
+    printf '\nProfile strategy (%s GB):\n' "${PROFILE}"
+    if [[ "${PROFILE}" == 32 ]]; then
+        printf '  Mode: locked validated configuration (no adaptive fitting)\n'
+        printf '  Context: %s\n  MoE cache: %s\n  KV: %s / %s\n' "${CTX_SIZE}" "${MOE_CACHE}" "${KV_K^^}" "${KV_V^^}"
+        printf '  Threads/batch/ubatch: %s / %s / %s\n' "${THREADS}" "${BATCH}" "${UBATCH}"
+    else
+        if [[ "${PROFILE}" == 24 ]]; then
+            printf '  Q8 context candidates: '; print_array_values "${Q8_CONTEXT_CANDIDATES[@]}"
+            printf '  Q4 fallback contexts:  '; print_array_values "${Q4_CONTEXT_CANDIDATES[@]}"
+            printf '  KV strategy: Q8_0 first, Q4_0 fallback\n'
+        else
+            printf '  Context candidates: '; print_array_values "${CONTEXT_CANDIDATES[@]}"
+            printf '  KV strategy: '; print_array_values "${KV_CANDIDATES[@]}"
+        fi
+        printf '  MoE cache candidates: '; print_array_values "${CACHE_CANDIDATES[@]}"
+        printf '  Batch/ubatch: %s / %s\n' "${BATCH}" "${UBATCH}"
+        (( BATCH_FALLBACK > 0 )) && printf '  OOM batch fallback: %s\n' "${BATCH_FALLBACK}"
+        printf '  Required VRAM headroom: %s MiB\n' "${HEADROOM_MIB}"
+    fi
+    printf '\nNo changes made.\n'
+}
+
 parse_cli() {
     local argument
     (($#)) || { usage >&2; exit 64; }
     for argument in "$@"; do
         case "${argument}" in
-            12|16|32|auto)
+            12|16|24|32|48|auto)
                 [[ -z "${REQUESTED_PROFILE}" ]] || die "Specify exactly one VRAM profile."
                 REQUESTED_PROFILE="${argument}"
                 ;;
             --retune) RETUNE=true ;;
             --force-profile) FORCE_PROFILE=true ;;
+            --dry-run) DRY_RUN=true ;;
             -h|--help) usage; exit 0 ;;
             *) usage >&2; die "Unknown argument: ${argument}" ;;
         esac
     done
-    [[ -n "${REQUESTED_PROFILE}" ]] || die "A VRAM profile (12, 16, 32, or auto) is required."
+    [[ -n "${REQUESTED_PROFILE}" ]] || die "A VRAM profile (12, 16, 24, 32, 48, or auto) is required."
     [[ "${REQUESTED_PROFILE}" != auto || "${FORCE_PROFILE}" == false ]] || \
         die "--force-profile is only meaningful with an explicit profile."
 }
@@ -134,21 +202,31 @@ parse_cli() {
 choose_profile() {
     local total_mib="$1"
     if [[ "${REQUESTED_PROFILE}" != auto ]]; then PROFILE="${REQUESTED_PROFILE}"; return; fi
-    if (( total_mib >= 10752 && total_mib < 15360 )); then
+    if (( total_mib >= 10752 && total_mib < 14848 )); then
         PROFILE=12
-    elif (( total_mib >= 15360 && total_mib < 24576 )); then
+    elif (( total_mib >= 14848 && total_mib < 20992 )); then
         PROFILE=16
-    elif (( total_mib >= 30720 )); then
+    elif (( total_mib >= 20992 && total_mib < 29184 )); then
+        PROFILE=24
+    elif (( total_mib >= 29184 && total_mib < 40960 )); then
         PROFILE=32
+    elif (( total_mib >= 40960 && total_mib <= 57344 )); then
+        PROFILE=48
     else
-        die "Auto-selection does not support ${total_mib} MiB VRAM. Supported bands are 10.5-14.9 GiB, 15-23.9 GiB, and >=30 GiB."
+        die "Auto-selection does not support ${total_mib} MiB VRAM. Supported bands are 10752-14847 MiB (12), 14848-20991 (16), 20992-29183 (24), 29184-40959 (32), and 40960-57344 (48)."
     fi
 }
 
 verify_manual_profile_capacity() {
     local minimum_mib
     [[ "${REQUESTED_PROFILE}" != auto ]] || return 0
-    case "${PROFILE}" in 12) minimum_mib=10752 ;; 16) minimum_mib=15360 ;; 32) minimum_mib=30720 ;; esac
+    case "${PROFILE}" in
+        12) minimum_mib=10752 ;;
+        16) minimum_mib=14848 ;;
+        24) minimum_mib=20992 ;;
+        32) minimum_mib=29184 ;;
+        48) minimum_mib=40960 ;;
+    esac
     if (( GPU_TOTAL_MIB < minimum_mib )); then
         if [[ "${FORCE_PROFILE}" == true ]]; then
             printf '\n*** DANGER: FORCING %s GB PROFILE ON A %s MiB GPU ***\n' "${PROFILE}" "${GPU_TOTAL_MIB}" >&2
@@ -185,23 +263,47 @@ derive_threads() {
 }
 
 load_profile_defaults() {
-    CONTEXT_CANDIDATES=(); CACHE_CANDIDATES=(); PARALLEL=1; SPEC_TYPE=none
+    CONTEXT_CANDIDATES=(); Q8_CONTEXT_CANDIDATES=(); Q4_CONTEXT_CANDIDATES=()
+    CACHE_CANDIDATES=(); KV_CANDIDATES=(); BATCH_FALLBACK=0
+    PARALLEL=1; SPEC_TYPE=none
     FORCED_PROFILE="${FORCE_PROFILE}"
     case "${PROFILE}" in
         32)
             CTX_SIZE=131072; MOE_CACHE=192; KV_K=q8_0; KV_V=q8_0
             THREADS=8; BATCH=4096; UBATCH=512; HEADROOM_MIB=1024
+            KV_CANDIDATES=(q8_0)
             ;;
         16)
             CONTEXT_CANDIDATES=(32768 24576 16384 12288)
             CACHE_CANDIDATES=(80 72 64 56 48)
+            KV_CANDIDATES=(q4_0)
             KV_K=q4_0; KV_V=q4_0; BATCH=2048; UBATCH=512; HEADROOM_MIB=1024
+            derive_threads
+            ;;
+        24)
+            Q8_CONTEXT_CANDIDATES=(65536 49152 32768 24576)
+            Q4_CONTEXT_CANDIDATES=(65536 49152 32768 24576 16384)
+            CONTEXT_CANDIDATES=("${Q8_CONTEXT_CANDIDATES[@]}")
+            CACHE_CANDIDATES=(144 128 112 96 80 64)
+            KV_CANDIDATES=(q8_0 q4_0)
+            KV_K=q8_0; KV_V=q8_0; BATCH=4096; BATCH_FALLBACK=2048; UBATCH=512; HEADROOM_MIB=1536
             derive_threads
             ;;
         12)
             CONTEXT_CANDIDATES=(16384 12288 8192)
             CACHE_CANDIDATES=(48 40 32 24 16)
+            KV_CANDIDATES=(q4_0)
             KV_K=q4_0; KV_V=q4_0; BATCH=1024; UBATCH=256; HEADROOM_MIB=768
+            derive_threads
+            ;;
+        48)
+            CONTEXT_CANDIDATES=(262144 196608 131072 98304 65536)
+            # The pinned fork documents rejection of negative sizes but no
+            # fixed positive maximum. Treat 256 as an unproven upper candidate;
+            # model-specific rejection remains an expected adaptive miss.
+            CACHE_CANDIDATES=(256 240 224 208 192 176)
+            KV_CANDIDATES=(q8_0)
+            KV_K=q8_0; KV_V=q8_0; BATCH=4096; UBATCH=512; HEADROOM_MIB=2048
             derive_threads
             ;;
     esac
@@ -287,7 +389,12 @@ prepare_clean_gpu() {
     ((${#stale[@]} == 0)) || die "A relevant llama-server remains before launch: ${stale[*]}"
     port_owner="$(ss -H -ltnp 'sport = :11434' 2>/dev/null || true)"
     [[ -z "${port_owner}" ]] || die "TCP port 11434 is owned by an unrelated listener: ${port_owner}"
-    if [[ "${PROFILE}" == 32 && "${FORCED_PROFILE}" != true ]]; then minimum_free=30000; else minimum_free=$((GPU_TOTAL_MIB - 2048)); fi
+    if [[ "${PROFILE}" == 32 && "${FORCED_PROFILE}" != true ]]; then
+        minimum_free=30000
+        (( GPU_TOTAL_MIB - 2048 < minimum_free )) && minimum_free=$((GPU_TOTAL_MIB - 2048))
+    else
+        minimum_free=$((GPU_TOTAL_MIB - 2048))
+    fi
     (( minimum_free < 0 )) && minimum_free=0
     free_mib="$(nvidia-smi --id=0 --query-gpu=memory.free --format=csv,noheader,nounits | head -n1 | xargs)"
     if (( free_mib < minimum_free )); then
@@ -400,15 +507,15 @@ stop_tuning_candidate() {
 }
 
 try_candidate() {
-    local context="$1" cache="$2" auth_file="$3" models_file="$4" chat_file="$5"
-    local free_mib=- used_mib=- decode=- load=FAIL result=EXPECTED_PROFILE_MISS candidate_log_start_line
+    local context="$1" cache="$2" kv="$3" candidate_batch="$4" auth_file="$5" models_file="$6" chat_file="$7"
+    local free_mib=- used_mib=- prompt_rate=- decode=- load=FAIL result=EXPECTED_PROFILE_MISS candidate_log_start_line
     local payload='{"model":"qwen3.8-flash","messages":[{"role":"user","content":"Reply with exactly the word READY."}],"temperature":0,"max_tokens":128}'
     prepare_clean_gpu
-    printf '\n[%s] candidate profile=%s context=%s cache=%s kv=%s\n' \
-        "$(date --iso-8601=seconds)" "${PROFILE}" "${context}" "${cache}" "${KV_K}" >>"${TUNE_LOG}"
+    printf '\n[%s] candidate profile=%s context=%s cache=%s kv=%s batch=%s\n' \
+        "$(date --iso-8601=seconds)" "${PROFILE}" "${context}" "${cache}" "${kv}" "${candidate_batch}" >>"${TUNE_LOG}"
     candidate_log_start_line=$(( $(wc -l <"${TUNE_LOG}") + 1 ))
     CANDIDATE_REASON=STARTUP_FAILED
-    server_arguments "${context}" "${cache}" "${KV_K}" "${KV_V}" "${THREADS}" "${BATCH}" "${UBATCH}"
+    server_arguments "${context}" "${cache}" "${kv}" "${kv}" "${THREADS}" "${candidate_batch}" "${UBATCH}"
     CUDA_VISIBLE_DEVICES=0 LLAMA_ATTN_ROT_DISABLE=1 COMPILE_OFF=1 \
         "${SERVER_BIN}" "${SERVER_ARGS[@]}" >>"${TUNE_LOG}" 2>&1 &
     TUNING_PID=$!
@@ -420,6 +527,7 @@ try_candidate() {
            jq -e '(.choices | length > 0) and (((.choices[0].message.content // "") | length > 0) or ((.choices[0].message.reasoning_content // "") | length > 0))' "${chat_file}" >/dev/null 2>&1 && \
            kill -0 "${TUNING_PID}" 2>/dev/null && \
            ! log_slice_has_oom "${TUNE_LOG}" "${candidate_log_start_line}"; then
+            prompt_rate="$(jq -r '.timings.prompt_per_second // empty' "${chat_file}" 2>/dev/null || true)"; [[ -n "${prompt_rate}" ]] || prompt_rate=-
             decode="$(jq -r '.timings.predicted_per_second // empty' "${chat_file}" 2>/dev/null || true)"; [[ -n "${decode}" ]] || decode=OK
             free_mib="$(nvidia-smi --id=0 --query-gpu=memory.free --format=csv,noheader,nounits | head -n1 | xargs)"
             used_mib="$(nvidia-smi --id=0 --query-gpu=memory.used --format=csv,noheader,nounits | head -n1 | xargs)"
@@ -433,46 +541,74 @@ try_candidate() {
             CANDIDATE_REASON=CUDA_OOM
         fi
     fi
-    printf '%-8s %-9s %-7s %-8s %-10s %-13s %-10s\n' "${context}" "${cache}" "${KV_K^^}" "${load}" "${decode}" "${used_mib}" "${free_mib}"
+    printf '%-8s %-7s %-7s %-7s %-8s %-10s %-10s %-13s %-10s\n' \
+        "${context}" "${cache}" "${kv^^}" "${candidate_batch}" "${load}" "${prompt_rate}" "${decode}" "${used_mib}" "${free_mib}"
+    printf '[%s] RESULT context=%s cache=%s kv=%s batch=%s load=%s prompt_tps=%s decode_tps=%s vram_used=%s vram_free=%s reason=%s\n' \
+        "$(date --iso-8601=seconds)" "${context}" "${cache}" "${kv}" "${candidate_batch}" "${load}" \
+        "${prompt_rate}" "${decode}" "${used_mib}" "${free_mib}" "${CANDIDATE_REASON}" >>"${TUNE_LOG}"
     stop_tuning_candidate
     [[ "${result}" == OK ]]
 }
 
 fit_adaptive_profile() {
-    local context cache auth_file models_file chat_file
+    local context cache kv candidate_batch primary_batch auth_file models_file chat_file
+    local -a active_contexts=()
     auth_file="$(mktemp /tmp/qwen38.auth.XXXXXX)"; models_file="$(mktemp /tmp/qwen38.models.XXXXXX.json)"; chat_file="$(mktemp /tmp/qwen38.chat.XXXXXX.json)"
     TEMP_FILES+=("${auth_file}" "${models_file}" "${chat_file}"); chmod 600 "${auth_file}" "${models_file}" "${chat_file}"
     printf 'Authorization: Bearer %s\n' "${API_KEY_VALUE}" >"${auth_file}"
     printf '\n[%s] starting adaptive fit for profile %s on %s (%s)\n' \
         "$(date --iso-8601=seconds)" "${PROFILE}" "${GPU_NAME}" "${GPU_UUID}" >>"${TUNE_LOG}"
     printf '\nAdaptive fit (first context-priority candidate with >= %s MiB free wins):\n' "${HEADROOM_MIB}"
-    printf '%-8s %-9s %-7s %-8s %-10s %-13s %-10s\n' CTX CACHE KV LOAD DECODE VRAM_USED VRAM_FREE
-    for context in "${CONTEXT_CANDIDATES[@]}"; do
-        for cache in "${CACHE_CANDIDATES[@]}"; do
-            if try_candidate "${context}" "${cache}" "${auth_file}" "${models_file}" "${chat_file}"; then
-                CTX_SIZE="${context}"; MOE_CACHE="${cache}"
-                log "Selected context ${CTX_SIZE}, MoE cache ${MOE_CACHE}, KV ${KV_K^^}."
-                printf '[%s] SELECTED context=%s cache=%s kv=%s\n' \
-                    "$(date --iso-8601=seconds)" "${CTX_SIZE}" "${MOE_CACHE}" "${KV_K}" >>"${TUNE_LOG}"
-                return 0
-            fi
-            log "EXPECTED_PROFILE_MISS: context ${context}, cache ${cache}, reason ${CANDIDATE_REASON}; trying the next safer candidate."
-            printf '[%s] EXPECTED_PROFILE_MISS context=%s cache=%s reason=%s\n' \
-                "$(date --iso-8601=seconds)" "${context}" "${cache}" "${CANDIDATE_REASON}" >>"${TUNE_LOG}"
+    printf '%-8s %-7s %-7s %-7s %-8s %-10s %-10s %-13s %-10s\n' \
+        CTX CACHE KV BATCH LOAD PROMPT_TPS DECODE_TPS VRAM_USED VRAM_FREE
+    primary_batch="${BATCH}"
+    for kv in "${KV_CANDIDATES[@]}"; do
+        if [[ "${PROFILE}" == 24 && "${kv}" == q8_0 ]]; then
+            active_contexts=("${Q8_CONTEXT_CANDIDATES[@]}")
+        elif [[ "${PROFILE}" == 24 && "${kv}" == q4_0 ]]; then
+            active_contexts=("${Q4_CONTEXT_CANDIDATES[@]}")
+        else
+            active_contexts=("${CONTEXT_CANDIDATES[@]}")
+        fi
+        for context in "${active_contexts[@]}"; do
+            for cache in "${CACHE_CANDIDATES[@]}"; do
+                candidate_batch="${primary_batch}"
+                if try_candidate "${context}" "${cache}" "${kv}" "${candidate_batch}" "${auth_file}" "${models_file}" "${chat_file}"; then
+                    CTX_SIZE="${context}"; MOE_CACHE="${cache}"; KV_K="${kv}"; KV_V="${kv}"; BATCH="${candidate_batch}"
+                    log "Selected context ${CTX_SIZE}, MoE cache ${MOE_CACHE}, KV ${KV_K^^}, batch ${BATCH}."
+                    printf '[%s] SELECTED context=%s cache=%s kv=%s batch=%s\n' \
+                        "$(date --iso-8601=seconds)" "${CTX_SIZE}" "${MOE_CACHE}" "${KV_K}" "${BATCH}" >>"${TUNE_LOG}"
+                    return 0
+                fi
+                log "EXPECTED_PROFILE_MISS: context ${context}, cache ${cache}, KV ${kv}, batch ${candidate_batch}, reason ${CANDIDATE_REASON}."
+                printf '[%s] EXPECTED_PROFILE_MISS context=%s cache=%s kv=%s batch=%s reason=%s\n' \
+                    "$(date --iso-8601=seconds)" "${context}" "${cache}" "${kv}" "${candidate_batch}" "${CANDIDATE_REASON}" >>"${TUNE_LOG}"
+                if [[ "${PROFILE}" == 24 && "${CANDIDATE_REASON}" == CUDA_OOM && "${BATCH_FALLBACK}" -gt 0 ]]; then
+                    candidate_batch="${BATCH_FALLBACK}"
+                    log "Retrying the same 24 GB candidate with reduced batch ${candidate_batch} after CUDA OOM."
+                    if try_candidate "${context}" "${cache}" "${kv}" "${candidate_batch}" "${auth_file}" "${models_file}" "${chat_file}"; then
+                        CTX_SIZE="${context}"; MOE_CACHE="${cache}"; KV_K="${kv}"; KV_V="${kv}"; BATCH="${candidate_batch}"
+                        log "Selected context ${CTX_SIZE}, MoE cache ${MOE_CACHE}, KV ${KV_K^^}, batch ${BATCH}."
+                        printf '[%s] SELECTED context=%s cache=%s kv=%s batch=%s\n' \
+                            "$(date --iso-8601=seconds)" "${CTX_SIZE}" "${MOE_CACHE}" "${KV_K}" "${BATCH}" >>"${TUNE_LOG}"
+                        return 0
+                    fi
+                    log "EXPECTED_PROFILE_MISS: reduced-batch retry reason ${CANDIDATE_REASON}."
+                    printf '[%s] EXPECTED_PROFILE_MISS context=%s cache=%s kv=%s batch=%s reason=%s\n' \
+                        "$(date --iso-8601=seconds)" "${context}" "${cache}" "${kv}" "${candidate_batch}" "${CANDIDATE_REASON}" >>"${TUNE_LOG}"
+                fi
+            done
         done
     done
-    if [[ "${PROFILE}" == 12 ]]; then
-        die "UD-Q3_K_XL could not pass validation at >=8192 context on this GPU. This combination is unsupported; no worse quant was downloaded."
-    fi
-    die "UD-Q3_K_XL could not find a safe 16 GB profile through 12288 context. Inspect ${TUNE_LOG}; no worse quant was downloaded."
+    case "${PROFILE}" in
+        12) die "UD-Q3_K_XL could not pass validation at >=8192 context on this GPU; no worse quant was downloaded." ;;
+        16) die "UD-Q3_K_XL could not find a safe 16 GB profile through 12288 context; no worse quant was downloaded." ;;
+        24) die "UD-Q3_K_XL could not find a safe 24 GB Q8/Q4 profile through the 16384 fallback; no worse quant was downloaded." ;;
+        48) die "UD-Q3_K_XL could not find a safe 48 GB Q8 profile through 65536 context; inspect ${TUNE_LOG}." ;;
+    esac
 }
 
 parse_cli "$@"
-require_root
-command -v flock >/dev/null 2>&1 || die "flock is missing. Install util-linux and rerun."
-exec 9>/var/lock/qwen38-bootstrap.lock
-flock -n 9 || die "Another qwen38 bootstrap is already running."
-
 stage 1 "Hardware and profile validation"
 [[ "$(uname -m)" == x86_64 ]] || die "This bootstrap supports Ubuntu 24.04 x86_64 only."
 [[ -r /etc/os-release ]] || die "Cannot identify the operating system."
@@ -489,18 +625,31 @@ GPU_TOTAL_MIB="$(nvidia-smi --id=0 --query-gpu=memory.total --format=csv,noheade
 DRIVER_VERSION="$(nvidia-smi --id=0 --query-gpu=driver_version --format=csv,noheader | head -n1 | xargs)"
 [[ "${GPU_TOTAL_MIB}" =~ ^[0-9]+$ ]] || die "Could not read physical VRAM from GPU 0."
 choose_profile "${GPU_TOTAL_MIB}"; verify_manual_profile_capacity; derive_cuda_architecture; load_profile_defaults
-version_ge "${DRIVER_VERSION}" "${MIN_DRIVER_VERSION}" || die "NVIDIA driver ${DRIVER_VERSION} is too old for CUDA 13.x (need >= ${MIN_DRIVER_VERSION})."
 TOTAL_RAM_KIB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"; RAM_AVAILABLE_KIB="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
-(( TOTAL_RAM_KIB >= MIN_RAM_KIB )) || die "At least nominal 64 GB RAM is required; detected $((TOTAL_RAM_KIB / 1024 / 1024)) GiB."
 printf '\nDetected deployment target:\n'
 printf '  GPU model:                %s\n' "${GPU_NAME}"
 printf '  Physical VRAM:            %s MiB (%s GiB)\n' "${GPU_TOTAL_MIB}" "$((GPU_TOTAL_MIB / 1024))"
 printf '  Compute capability:       %s\n' "${GPU_CC}"
 printf '  Selected VRAM profile:    %s GB\n' "${PROFILE}"
 printf '  CMake CUDA architecture:  %s\n' "${CMAKE_CUDA_ARCH}"
+printf '  NVIDIA driver:            %s\n' "${DRIVER_VERSION}"
 printf '  System RAM total/free:    %s GiB / %s GiB\n' "$((TOTAL_RAM_KIB / 1024 / 1024))" "$((RAM_AVAILABLE_KIB / 1024 / 1024))"
+if [[ "${DRY_RUN}" == true ]]; then
+    if (( TOTAL_RAM_KIB < MIN_RAM_KIB )); then
+        printf 'WARNING: a real deployment would fail because at least nominal 64 GB RAM is required.\n' >&2
+    elif [[ "${PROFILE}" != 32 && "${TOTAL_RAM_KIB}" -lt "${RECOMMENDED_RAM_KIB}" ]]; then
+        printf 'WARNING: adaptive profiles strongly recommend 96 GB+ RAM.\n' >&2
+    fi
+    print_dry_run_strategy
+    exit 0
+fi
+
+require_root
+acquire_bootstrap_lock
+version_ge "${DRIVER_VERSION}" "${MIN_DRIVER_VERSION}" || die "NVIDIA driver ${DRIVER_VERSION} is too old for CUDA 13.x (need >= ${MIN_DRIVER_VERSION})."
+(( TOTAL_RAM_KIB >= MIN_RAM_KIB )) || die "At least nominal 64 GB RAM is required; detected $((TOTAL_RAM_KIB / 1024 / 1024)) GiB."
 if [[ "${PROFILE}" != 32 && "${TOTAL_RAM_KIB}" -lt "${RECOMMENDED_RAM_KIB}" ]]; then
-    printf 'WARNING: 12/16 GB profiles strongly recommend 96 GB+ RAM; this host has %s GiB.\n' "$((TOTAL_RAM_KIB / 1024 / 1024))" >&2
+    printf 'WARNING: adaptive profiles strongly recommend 96 GB+ RAM; this host has %s GiB.\n' "$((TOTAL_RAM_KIB / 1024 / 1024))" >&2
 fi
 
 mkdir -p "${QWEN_ROOT}"
@@ -551,6 +700,7 @@ packages=(build-essential ca-certificates ccache cmake curl g++-13 gcc-13 git ip
 missing_packages=()
 for package in "${packages[@]}"; do dpkg-query -W -f='${Status}' "${package}" 2>/dev/null | grep -q 'ok installed' || missing_packages+=("${package}"); done
 if ((${#missing_packages[@]})); then apt-get install -y --no-install-recommends "${missing_packages[@]}"; else log "All required Ubuntu packages are installed."; fi
+acquire_flock_after_dependencies
 
 stage 3 "CUDA Toolkit"
 CUDA_HOME=""
@@ -768,7 +918,12 @@ print_config() {
 }
 wait_for_clean_vram() {
     local free_mib minimum deadline=$((SECONDS + 60))
-    if [[ "${PROFILE}" == 32 && "${FORCED_PROFILE:-false}" != true ]]; then minimum=30000; else minimum=$((VRAM_MB - 2048)); fi
+    if [[ "${PROFILE}" == 32 && "${FORCED_PROFILE:-false}" != true ]]; then
+        minimum=30000
+        (( VRAM_MB - 2048 < minimum )) && minimum=$((VRAM_MB - 2048))
+    else
+        minimum=$((VRAM_MB - 2048))
+    fi
     (( minimum < 0 )) && minimum=0
     while (( SECONDS < deadline )); do free_mib="$(nvidia-smi --id=0 --query-gpu=memory.free --format=csv,noheader,nounits | head -n1 | xargs)"; (( free_mib >= minimum )) && return 0; sleep 2; done
     printf 'Only %s MiB VRAM is free; expected at least %s MiB before startup.\n' "${free_mib}" "${minimum}" >&2
