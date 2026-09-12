@@ -355,6 +355,50 @@ select_validated_32_fast_path() {
     fi
 }
 
+verify_checkout_origin() {
+    local checkout="$1" expected_repo="$2" existing_origin
+    existing_origin="$(git -C "${checkout}" remote get-url origin 2>/dev/null || true)"
+    case "${existing_origin}" in
+        "${expected_repo}"|"${expected_repo%.git}") ;;
+        git@github.com:GenerelSchwerz/llama.cpp.git)
+            [[ "${expected_repo}" == "${LLAMA_REPO}" ]] || \
+                die "${checkout} has unexpected origin '${existing_origin}'."
+            ;;
+        *) die "${checkout} has unexpected origin '${existing_origin}'." ;;
+    esac
+}
+
+require_clean_tracked_checkout() {
+    local checkout="$1" tracked_status
+    tracked_status="$(git -C "${checkout}" status --porcelain --untracked-files=no)"
+    [[ -z "${tracked_status}" ]] && return 0
+    printf 'Tracked changes exist in %s:\n' "${checkout}" >&2
+    sed -n '1,12p' <<<"${tracked_status}" >&2
+    die "Refusing to overwrite local modifications."
+}
+
+prepare_pinned_checkout() {
+    local checkout="$1" expected_repo="$2" pinned_commit="$3" checkout_created=false
+    if [[ ! -e "${checkout}" ]]; then
+        git clone --filter=blob:none --no-checkout "${expected_repo}" "${checkout}"
+        checkout_created=true
+    elif [[ ! -d "${checkout}/.git" ]]; then
+        die "${checkout} exists but is not a git checkout."
+    fi
+
+    verify_checkout_origin "${checkout}" "${expected_repo}"
+    if [[ "${checkout_created}" != true ]]; then
+        require_clean_tracked_checkout "${checkout}"
+    fi
+    if ! git -C "${checkout}" cat-file -e "${pinned_commit}^{commit}" 2>/dev/null; then
+        git -C "${checkout}" fetch --no-tags --depth=1 origin "${pinned_commit}"
+    fi
+    git -C "${checkout}" checkout --detach "${pinned_commit}"
+    [[ "$(git -C "${checkout}" rev-parse HEAD)" == "${pinned_commit}" ]] || \
+        die "Pinned checkout verification failed."
+    require_clean_tracked_checkout "${checkout}"
+}
+
 relevant_pids() {
     local proc pid executable commandline process_name
     for proc in /proc/[0-9]*; do
@@ -777,16 +821,7 @@ NVCC_VERSION="$("${NVCC}" --version | tail -n1)"; log "Using ${NVCC_VERSION} fro
 
 stage 4 "Pinned llama.cpp source"
 mkdir -p "${QWEN_ROOT}" "${QWEN_ROOT}/models" "${LOG_DIR}"
-if [[ ! -e "${LLAMA_DIR}" ]]; then git clone --filter=blob:none --no-checkout "${LLAMA_REPO}" "${LLAMA_DIR}"
-elif [[ ! -d "${LLAMA_DIR}/.git" ]]; then die "${LLAMA_DIR} exists but is not a git checkout."
-else
-    EXISTING_ORIGIN="$(git -C "${LLAMA_DIR}" remote get-url origin 2>/dev/null || true)"
-    case "${EXISTING_ORIGIN}" in "${LLAMA_REPO}"|"${LLAMA_REPO%.git}"|git@github.com:GenerelSchwerz/llama.cpp.git) ;; *) die "${LLAMA_DIR} has unexpected origin '${EXISTING_ORIGIN}'." ;; esac
-fi
-if ! git -C "${LLAMA_DIR}" cat-file -e "${LLAMA_COMMIT}^{commit}" 2>/dev/null; then git -C "${LLAMA_DIR}" fetch --no-tags --depth=1 origin "${LLAMA_COMMIT}"; fi
-[[ -z "$(git -C "${LLAMA_DIR}" status --porcelain --untracked-files=no)" ]] || die "Tracked changes exist in ${LLAMA_DIR}."
-git -C "${LLAMA_DIR}" checkout --detach "${LLAMA_COMMIT}"
-[[ "$(git -C "${LLAMA_DIR}" rev-parse HEAD)" == "${LLAMA_COMMIT}" ]] || die "Pinned checkout verification failed."
+prepare_pinned_checkout "${LLAMA_DIR}" "${LLAMA_REPO}" "${LLAMA_COMMIT}"
 
 stage 5 "Architecture-specific llama.cpp build"
 BUILD_SIGNATURE="commit=${LLAMA_COMMIT};cuda=${NVCC_VERSION};arch=${CMAKE_CUDA_ARCH};gcc=13;profile=qwen38-v1"
