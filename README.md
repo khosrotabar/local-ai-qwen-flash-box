@@ -2,26 +2,48 @@
 
 This repository bootstraps the same Qwen 3.8 Flash Next `UD-Q3_K_XL` deployment for NVIDIA GPUs in 12 GB, 16 GB, 24 GB, 32 GB, and 48 GB VRAM classes. It keeps the pinned model and MoE-cache llama.cpp fork, derives the CUDA build architecture from the GPU's reported compute capability, and exposes an authenticated OpenAI-compatible API for DeepSeek Harness and other coding agents.
 
-## Quick start
+## Profile and context selection
 
 On Ubuntu 24.04 x86_64, run as root with a working NVIDIA driver:
 
 ```bash
 chmod +x bootstrap.sh
-sudo ./bootstrap.sh auto
+sudo ./bootstrap.sh auto auto
 ```
 
-Or select the desired VRAM profile explicitly:
+The first argument selects the VRAM profile. The optional second argument selects context: `auto`, `32`/`32k`, `64`/`64k`, `128`/`128k`, or `256`/`256k`. Omitting context is backward-compatible and means `auto`.
 
 ```bash
-sudo ./bootstrap.sh 12
-sudo ./bootstrap.sh 16
-sudo ./bootstrap.sh 24
-sudo ./bootstrap.sh 32
-sudo ./bootstrap.sh 48
+# 16 GB GPU, require exactly 64K context
+sudo ./bootstrap.sh 16 64
+sudo ./bootstrap.sh 16 64k
+
+# 16 GB GPU, let the bootstrap choose context
+sudo ./bootstrap.sh 16 auto
+
+# 32 GB GPU, require exactly 128K or 256K
+sudo ./bootstrap.sh 32 128
+sudo ./bootstrap.sh 32 256
+
+# 32 GB GPU, automatically find the highest safe context
+sudo ./bootstrap.sh 32 auto
+
+# Automatically detect the VRAM profile and context
+sudo ./bootstrap.sh auto auto
 ```
 
-`auto` uses tolerant MiB thresholds matching real NVIDIA reports:
+Context aliases normalize to exact token counts:
+
+| Context argument | Resolved request |
+| --- | --- |
+| `32` or `32k` | 32768 |
+| `64` or `64k` | 65536 |
+| `128` or `128k` | 131072 |
+| `256` or `256k` | 262144 |
+
+**An explicit context is never silently downgraded.** The bootstrap tunes only cache, allowed KV precision, and bounded batch settings around that exact context. If no candidate runs safely, it exits with suggested lower-context or auto commands.
+
+An `auto` profile uses tolerant MiB thresholds matching real NVIDIA reports:
 
 | Detected physical VRAM | Selected profile |
 | --- | --- |
@@ -33,30 +55,34 @@ sudo ./bootstrap.sh 48
 
 VRAM outside those ranges—including 80 GB GPUs—fails instead of silently selecting an unsafe profile. A manual selection is checked against physical VRAM; `--force-profile` bypasses that check and the normal pre-launch threshold with a prominent warning. It is intended only for experts and cannot make an oversized configuration fit.
 
-| Profile | Typical GPU | Context strategy | KV | MoE cache | Status |
+| Profile | Typical GPU | Auto-context order | KV | MoE cache | Status |
 | --- | --- | --- | --- | --- | --- |
-| 12 GB | RTX 5070 12 GB and similar | Tries 16384, 12288, then 8192 | Q4_0 / Q4_0 | Tries 48, 40, 32, 24, 16 per context | Supported but experimental |
-| 16 GB | RTX 5070 Ti / RTX 5060 Ti 16 GB | Tries 32768, 24576, 16384, then 12288 | Q4_0 / Q4_0 | Tries 80, 72, 64, 56, 48 per context | Adaptive; hardware-dependent |
-| 24 GB | RTX 3090, RTX 4090, L4, A30 | Q8: 65536→24576; Q4 fallback: 65536→16384 | Q8_0 first, then Q4_0 | Tries 144, 128, 112, 96, 80, 64 | Adaptive performance profile |
-| 32 GB | RTX 5090 32 GB | Locked at 131072 | Q8_0 / Q8_0 | Locked at 192 | Validated production configuration |
-| 48 GB | RTX A6000, RTX 6000 Ada, A40 | Tries 262144, 196608, 131072, 98304, 65536 | Q8_0 / Q8_0 | Tries 256, 240, 224, 208, 192, 176 | Adaptive high-VRAM profile |
+| 12 GB | RTX 5070 12 GB and similar | 64K, 32K, 24K, 16K, 12K, then existing 8K emergency fallback | Q4_0 | 48, 40, 32, 24, 16 | Experimental adaptive |
+| 16 GB | RTX 5080 / RTX 5070 Ti / RTX 5060 Ti | 64K, 32K, 24K, 16K, 12K | Q8_0 first, then Q4_0 | 80, 72, 64, 56, 48, 40, 32 | Adaptive |
+| 24 GB | RTX 3090, RTX 4090, L4, A30 | 128K, 64K, 32K | Q8_0 first, then Q4_0 | 144, 128, 112, 96, 80, 64 | Adaptive performance profile |
+| 32 GB | RTX 5090 32 GB | 256K, 128K, 64K, 32K | Q8_0 first, then Q4_0 | 192, 160, 128, 96, 64 | Adaptive; locked fast path for known 128K setup |
+| 48 GB | RTX A6000, RTX 6000 Ada, A40 | 256K, 128K, 64K, 32K | Q8_0 | 256, 240, 224, 208, 192, 176 | Adaptive high-VRAM profile |
 
-Adaptive fitting prioritizes context over small decode gains. Each candidate must load, expose authenticated `/v1/models`, complete a real chat request with a 128-token output budget, remain free of CUDA OOMs, and retain the profile's VRAM headroom. OOM signatures stop a candidate early, and the append-only tuning log records candidate boundaries and rejection reasons. The concise fit table records prompt and decode rates when reported plus used/free VRAM. It stops after the first safe context-priority result. The 24 GB profile requires 1536 MiB free and may retry an OOMed candidate at batch 2048 before sacrificing context; the 48 GB profile requires 2048 MiB free.
+Adaptive fitting iterates context first, then KV precision, then MoE cache. It therefore keeps a stable 64K configuration over a slightly faster 32K result. Each candidate must load, expose authenticated `/v1/models`, complete a real chat request with a 128-token output budget, remain free of CUDA OOMs, keep its process alive, and retain the profile's VRAM headroom. OOM signatures stop a candidate early, and the append-only tuning log records prompt/decode rates, VRAM use, and rejection reasons.
+
+For the RTX 5080 16 GB case, `sudo ./bootstrap.sh 16 64 --retune` tests only `CTX_SIZE=65536`: Q8 KV before Q4, cache `80 72 64 56 48 40 32`, batch `2048`, and one bounded `1024` retry after CUDA OOM. It requires at least 1024 MiB free VRAM. If none pass, the command fails instead of trying 32K.
+
+The 24 GB profile requires 1536 MiB free and uses batch 4096 with a bounded 2048 OOM retry. The 48 GB profile remains Q8, requires 2048 MiB free, and has the same bounded batch retry. All profiles use one parallel slot with MTP/speculation disabled.
 
 The 24 GB and 48 GB strategies are adaptive and are not claimed to be universally benchmarked until tested on representative real GPUs. Capacity and speed are evaluated separately; no universal throughput cutoff rejects a legitimately slower GPU.
 
-The 32 GB profile is never auto-tuned. Its runtime remains exactly context `131072`, MoE cache `192`, threads `8`, batch `4096`, ubatch `512`, one slot, Q8_0 K/V, all GPU layers, flash attention on, and MTP/speculation off.
+The validated 32 GB RTX 5090 configuration remains exactly context `131072`, MoE cache `192`, threads `8`, batch `4096`, ubatch `512`, one slot, Q8_0 K/V, all GPU layers, flash attention on, and MTP/speculation off. On matching RTX 5090 hardware, an explicit `32 128` request reuses those values without unnecessary fitting unless `--retune` is supplied. Requests such as `32 64`, `32 256`, and `32 auto` follow the requested fixed or auto-context strategy instead.
 
 ## Hardware and pinned inputs
 
 - Ubuntu 24.04 x86_64
 - A working NVIDIA driver from the 580+ family; the script does not install or replace the driver
 - CUDA Toolkit 13.2 (installed toolkit-only if absent)
-- At least nominal 64 GB system RAM
+- A nominal 64 GB system RAM class (approximately 60 GiB Linux-visible RAM is accepted)
 - 96 GB+ RAM strongly recommended for every adaptive profile
 - At least 130 GiB deployment capacity, including verified reusable artifacts
 
-This model places substantial pressure on system RAM even with 24 GB or 48 GB VRAM. Both RAM capacity and memory bandwidth can strongly affect load time and decode throughput. A 64–95 GB host is warned but not rejected for adaptive profiles; less than 64 GB fails. Swap is not created automatically.
+This model places substantial pressure on system RAM even with 24 GB or 48 GB VRAM. Both RAM capacity and memory bandwidth can strongly affect load time and decode throughput. Hosts below the 96 GB recommendation are warned; genuinely lower-memory machines below the nominal 64 GB-class threshold fail. Swap is not created automatically.
 
 Pinned artifacts:
 
@@ -73,14 +99,14 @@ Bootstrap concurrency is protected by an atomic directory lock even on minimal i
 If Hugging Face authentication is required, export `HF_TOKEN` and use:
 
 ```bash
-sudo --preserve-env=HF_TOKEN ./bootstrap.sh auto
+sudo --preserve-env=HF_TOKEN ./bootstrap.sh auto auto
 ```
 
 Do not put the token in this repository.
 
 ## Fitted configuration and retuning
 
-The resolved production configuration is stored at `/root/qwen38/profile.env`. It includes the selected profile, GPU name and UUID, physical VRAM, compute capability, context, MoE cache, KV types, threads, batches, pinned revisions, CUDA build architecture, and binary/model paths.
+The resolved production configuration is stored at `/root/qwen38/profile.env`. It includes `CONTEXT_MODE` and normalized `REQUESTED_CONTEXT` alongside the resolved `CTX_SIZE`, selected profile, GPU identity, physical VRAM, compute capability, MoE cache, KV types, threads, batches, pinned revisions, CUDA build architecture, and binary/model paths.
 
 Inspect it with:
 
@@ -91,13 +117,13 @@ sudo /root/qwen38/start-qwen38.sh status
 
 Adaptive-fit details and rejection reasons are retained in `/root/qwen38/logs/qwen38-tuning.log`.
 
-On rerun, an adaptive fit is reused only when the GPU name and UUID, VRAM, selected profile, compute capability, model revision, llama.cpp commit, and CUDA build architecture match. To repeat only adaptive fitting while preserving the downloaded model, verified build, and API key:
+On rerun, a fit is reused only when the GPU name and UUID, VRAM, selected profile, context mode/request, compute capability, model revision, llama.cpp commit, and CUDA build architecture match. A cached `16 32` result cannot satisfy `16 64`. To repeat only fitting while preserving the downloaded model, verified build, and API key:
 
 ```bash
-sudo ./bootstrap.sh 16 --retune
-sudo ./bootstrap.sh 24 --retune
-sudo ./bootstrap.sh 48 --retune
-sudo ./bootstrap.sh auto --retune
+sudo ./bootstrap.sh 16 64 --retune
+sudo ./bootstrap.sh 24 128 --retune
+sudo ./bootstrap.sh 48 auto --retune
+sudo ./bootstrap.sh auto auto --retune
 ```
 
 ## Dry run
@@ -105,12 +131,13 @@ sudo ./bootstrap.sh auto --retune
 Dry-run inspects local GPU/RAM information and prints the selected strategy without installing packages or CUDA, cloning/building llama.cpp, downloading the model, starting a server, acquiring deployment locks, or touching the API key:
 
 ```bash
-sudo ./bootstrap.sh auto --dry-run
-sudo ./bootstrap.sh 24 --dry-run
-sudo ./bootstrap.sh 48 --dry-run
+sudo ./bootstrap.sh 16 64 --dry-run
+sudo ./bootstrap.sh 32 256 --dry-run
+sudo ./bootstrap.sh 32 auto --dry-run
+sudo ./bootstrap.sh auto auto --dry-run
 ```
 
-Dry-run also shows the independently derived CMake CUDA architecture and the exact context, KV, cache, batch, and headroom strategy for the selected profile.
+Dry-run shows the independently derived CMake CUDA architecture, context mode, normalized request, and exact context/KV/cache/batch/headroom strategy. It exits before locks, package or CUDA installation, downloads, builds, server startup, API-key handling, or persistent configuration writes.
 
 ## Operation, API, and recovery
 
